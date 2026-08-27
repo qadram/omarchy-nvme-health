@@ -132,9 +132,18 @@ Panel {
 
   Process {
     id: proc
+    // Absolute path, not bare "python3": a version manager (mise, asdf,
+    // pyenv, etc.) that puts its shims ahead of /usr/bin in PATH -- a
+    // common, supported setup, not a misconfiguration -- makes a
+    // PATH-resolved "python3" hit an isolated interpreter with no
+    // python-gobject installed instead of the system one this plugin
+    // depends on for UDisks2/gi access. Reproduced directly: status.py
+    // raised `ModuleNotFoundError: No module named 'gi'` under a mise
+    // Python, and returned real SMART JSON under /usr/bin/python3 on the
+    // same machine, same install, only the interpreter changed.
     command: root.configuredDevice !== ""
-      ? ["python3", root.pluginDir + "/status.py", root.configuredDevice]
-      : ["python3", root.pluginDir + "/status.py"]
+      ? ["/usr/bin/python3", root.pluginDir + "/status.py", root.configuredDevice]
+      : ["/usr/bin/python3", root.pluginDir + "/status.py"]
     stdout: StdioCollector {
       id: statusStdout
       waitForEnd: true
