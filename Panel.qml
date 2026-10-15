@@ -17,7 +17,14 @@ Panel {
   property bool loading: false
   property string lastError: ""
 
-  readonly property var disk: status && status.disk ? status.disk : null
+  // Every drive status.py listed. Older payloads only carried `disk`.
+  readonly property var disks: {
+    if (status && status.disks && status.disks.length > 0) return status.disks
+    if (status && status.disk) return [status.disk]
+    return []
+  }
+  // The drive the bar speaks for: whichever most deserves attention.
+  readonly property var disk: Model.worstDisk(root.disks)
   readonly property bool warning: disk ? disk.warning === true : (status ? status.ok === false : false)
   readonly property string label: Model.barLabel(disk, false, status && status.ok === false)
 
@@ -32,6 +39,18 @@ Panel {
     if (s.length > 64) return s.substring(0, 64)
     return s
   }
+
+  readonly property bool notifyEnabled: setting("notify", true) !== false
+  readonly property string statePath: {
+    var base = String(Quickshell.env("XDG_STATE_HOME") || "").trim()
+    if (base === "") base = String(Quickshell.env("HOME") || "") + "/.local/state"
+    return base + "/omarchy/nvme-health/severity.json"
+  }
+
+  // Severity seen on the previous poll, keyed by device. Persisted so a
+  // notification fires when a disk gets worse, not on every refresh.
+  property var lastSeen: ({})
+  property bool stateLoaded: false
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property color contentDim: Qt.darker(contentForeground, 1.5)
@@ -78,21 +97,116 @@ Panel {
     status = parsed
     if (!parsed.ok && parsed.message)
       lastError = String(parsed.message).substring(0, 256)
+    checkTransitions()
   }
 
-  function metricValue(key) {
-    if (!disk) return "—"
-    if (key === "hours") return Model.formatHours(disk.powerOnHours)
-    if (key === "realloc") {
-      if (disk.protocol === "nvme")
-        return disk.mediaErrors === null || disk.mediaErrors === undefined ? "—" : String(disk.mediaErrors)
-      return disk.reallocatedSectors === null || disk.reallocatedSectors === undefined ? "—" : String(disk.reallocatedSectors)
+  function severityMap(list) {
+    var map = {}
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i]
+      if (d && d.device) map[String(d.device)] = Model.severityRank(d)
     }
-    if (key === "tbw") return Model.formatTiB(disk.tbwTiB)
-    if (key === "life") return Model.formatPercent(disk.lifeRemainingPercent)
-    if (key === "spare") return Model.formatPercent(disk.availableSparePercent)
-    if (key === "used") return Model.formatPercent(disk.percentageUsed)
+    return map
+  }
+
+  function severityReason(d) {
+    if (Model.asInt(d.criticalWarning, 0) !== 0) return "SMART critical warning"
+    if (Model.asInt(d.mediaErrors, 0) > 0) return "media errors: " + d.mediaErrors
+    if (d.warning === true)
+      return "SMART warning, life " + Model.formatPercent(d.lifeRemainingPercent)
+    if (Model.asInt(d.availableSparePercent, 100) < 100)
+      return "spare down to " + Model.formatPercent(d.availableSparePercent)
+    return "state changed"
+  }
+
+  // Notify only when a disk's severity rises. One notification per poll: if
+  // several disks worsen at once, the worst one speaks for the batch.
+  function checkTransitions() {
+    if (!root.stateLoaded) return
+    var current = severityMap(root.disks)
+    var worsened = null
+    for (var i = 0; i < root.disks.length; i++) {
+      var d = root.disks[i]
+      if (!d || !d.device) continue
+      var key = String(d.device)
+      var before = root.lastSeen.hasOwnProperty(key) ? Number(root.lastSeen[key]) : 0
+      var now = Number(current[key])
+      if (now > before && (worsened === null || now > Model.severityRank(worsened)))
+        worsened = d
+    }
+    root.lastSeen = current
+    stateFile.setText(JSON.stringify({ version: 1, severity: current }, null, 2) + "\n")
+    if (worsened && root.notifyEnabled) notifyDegraded(worsened)
+  }
+
+  function notifyDegraded(d) {
+    notifier.command = [
+      "notify-send",
+      "--app-name=NVMe Health",
+      "--urgency=" + (Model.severityRank(d) >= 3 ? "critical" : "normal"),
+      root.shortDevice(d) + " health changed",
+      (d.model ? String(d.model) + " — " : "") + root.severityReason(d)
+    ]
+    notifier.running = true
+  }
+
+  function metricValue(d, key) {
+    if (!d) return "—"
+    if (key === "temp")
+      return d.temperatureC === null || d.temperatureC === undefined
+        ? "—" : String(d.temperatureC) + "°C"
+    if (key === "life") return Model.formatPercent(d.lifeRemainingPercent)
+    if (key === "spare") return Model.formatPercent(d.availableSparePercent)
+    if (key === "errors") {
+      var v = d.protocol === "nvme" ? d.mediaErrors : d.reallocatedSectors
+      return v === null || v === undefined ? "—" : String(v)
+    }
+    if (key === "hours") return Model.formatHours(d.powerOnHours)
+    if (key === "tbw") return Model.formatTiB(d.tbwTiB)
     return "—"
+  }
+
+  // "/dev/nvme2n1" -> "nvme2n1"; the /dev/ prefix is noise in a narrow column.
+  function shortDevice(d) {
+    if (!d || !d.device) return "—"
+    var s = String(d.device)
+    return s.indexOf("/dev/") === 0 ? s.substring(5) : s
+  }
+
+  function diskColor(d) {
+    if (!d || d.available === false) return root.contentDim
+    if (d.warning === true || Model.severityRank(d) >= 3)
+      return root.bar ? root.bar.urgent : Color.urgent
+    return root.contentForeground
+  }
+
+  FileView {
+    id: stateFile
+    path: root.statePath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(String(text() || ""))
+        if (parsed && typeof parsed === "object" && parsed.severity)
+          root.lastSeen = parsed.severity
+      } catch (e) {
+        root.lastSeen = ({})
+      }
+      root.stateLoaded = true
+    }
+    onLoadFailed: {
+      // First run, or the state file was removed: start from a clean slate.
+      root.lastSeen = ({})
+      root.stateLoaded = true
+    }
+  }
+
+  // argv array, never a shell string: disk model strings reach notify-send as
+  // a single argument and cannot be interpreted.
+  Process {
+    id: notifier
   }
 
   Timer {
@@ -173,7 +287,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(320))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(content.implicitHeight)
 
     PanelKeyCatcher {
@@ -193,21 +307,14 @@ Panel {
 
         Text {
           width: parent.width
-          text: disk && disk.model ? disk.model : "Disk SMART"
+          text: root.disks.length > 0
+            ? "Disk SMART — " + root.disks.length + (root.disks.length === 1 ? " drive" : " drives")
+            : "Disk SMART"
           color: root.contentForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
           wrapMode: Text.WordWrap
-        }
-
-        Text {
-          width: parent.width
-          visible: disk && disk.device
-          text: disk ? String(disk.device) : ""
-          color: root.contentDim
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.caption
         }
 
         Text {
@@ -224,64 +331,128 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        Text {
-          width: parent.width
-          visible: !!disk
-          text: {
-            if (!disk) return ""
-            if (disk.passed === true) return "SMART: PASSED"
-            if (disk.passed === false) return "SMART: FAILED"
-            return root.loading ? "Refreshing…" : "SMART status"
-          }
-          color: disk && disk.passed === false
-            ? (root.bar ? root.bar.urgent : Color.urgent)
-            : root.contentForeground
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Column {
+        // One aligned row per drive. Explicit widths instead of a nested
+        // Repeater so the columns line up without a layout pass.
+        Row {
           width: parent.width
           spacing: Style.space(6)
-          visible: !!disk
+          visible: root.disks.length > 0
 
-          Repeater {
-            model: [
-              { label: "Life remaining", key: "life" },
-              { label: "Power-on", key: "hours" },
-              { label: disk && disk.protocol === "nvme" ? "Media errors" : "Reallocated sectors", key: "realloc" },
-              { label: "TBW", key: "tbw" },
-              { label: "Spare", key: "spare" },
-              { label: "Wear used", key: "used" }
-            ]
+          Text {
+            width: Style.space(76)
+            text: "DRIVE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-            Row {
-              required property var modelData
-              width: content.width
-              spacing: Style.space(12)
-              visible: {
-                if (!disk) return false
-                if (modelData.key === "spare" || modelData.key === "used")
-                  return disk.protocol === "nvme"
-                return true
-              }
+          Text {
+            width: Style.space(130)
+            text: "MODEL"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-              Text {
-                width: Style.space(150)
-                text: modelData.label
-                color: root.contentDim
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
+          Text {
+            width: Style.space(46)
+            horizontalAlignment: Text.AlignRight
+            text: "TEMP"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-              Text {
-                text: root.metricValue(modelData.key)
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
+          Text {
+            width: Style.space(46)
+            horizontalAlignment: Text.AlignRight
+            text: "LIFE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: Style.space(52)
+            horizontalAlignment: Text.AlignRight
+            text: "SPARE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: Style.space(40)
+            horizontalAlignment: Text.AlignRight
+            text: "ERR"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Repeater {
+          model: root.disks
+
+          Row {
+            required property var modelData
+            width: content.width
+            spacing: Style.space(6)
+
+            Text {
+              width: Style.space(76)
+              text: root.shortDevice(modelData)
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: modelData === root.disk
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: Style.space(130)
+              text: modelData.model ? String(modelData.model) : "—"
+              color: root.contentDim
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: Style.space(46)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "temp")
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(46)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "life")
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(52)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "spare")
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(40)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "errors")
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: root.metricValue(modelData, "errors") !== "0"
             }
           }
         }
