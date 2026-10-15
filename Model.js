@@ -122,6 +122,13 @@ function worsenedDisk(previous, disks) {
   return found
 }
 
+// "/dev/nvme2n1" -> "nvme2n1"; the /dev/ prefix is noise in a narrow column.
+function shortDevice(disk) {
+  if (!disk || !disk.device) return "\u2014"
+  var s = String(disk.device)
+  return s.indexOf("/dev/") === 0 ? s.substring(5) : s
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     asInt: asInt,
@@ -135,6 +142,7 @@ if (typeof module !== "undefined") {
     worstDisk: worstDisk,
     severityMap: severityMap,
     worsenedDisk: worsenedDisk,
+    shortDevice: shortDevice,
     MAX_STATUS_CHARS: MAX_STATUS_CHARS
   }
 }

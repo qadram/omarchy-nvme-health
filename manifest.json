@@ -2,14 +2,16 @@
   "schemaVersion": 1,
   "id": "io.github.qadram.nvme-health",
   "name": "NVMe Health",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "qadram",
   "license": "MIT",
   "description": "Disk SMART health for every drive in the Omarchy bar via UDisks2: temperature, remaining life, spare and media errors, with a notification when a disk gets worse.",
   "kinds": [
+    "service",
     "bar-widget"
   ],
   "entryPoints": {
+    "service": "Service.qml",
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {

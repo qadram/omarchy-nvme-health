@@ -65,6 +65,21 @@ Optional settings on the widget entry in `~/.config/omarchy/shell.json`:
 - `device` — e.g. `/dev/nvme0n1`. Empty (the default) watches every drive.
 - `notify` — `true` (default) or `false`
 
+## Multi-monitor and replacement bars
+
+The bar instantiates one widget per screen, so the poll, the persisted state
+and the notification live in a service (`kinds: ["service", "bar-widget"]`),
+which the shell instantiates once. Without that, a four-monitor machine runs
+four `status.py` processes per tick and sends four identical notifications for
+one event.
+
+Under a third-party *replacement* bar, `bar.shell.serviceFor()` returns null by
+design, so the widget cannot reach its own service — known upstream as
+[omarchy#11796](https://github.com/omacom/omarchy/issues/11796) and
+[#13289](https://github.com/omacom/omarchy/issues/13289). The bar then shows
+`?` and the panel says so, rather than rendering an icon that quietly does
+nothing. Under the built-in bar everything works.
+
 ## Tests
 
 No dependencies beyond the stdlib and the system Python.

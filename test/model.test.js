@@ -106,3 +106,15 @@ test("severityMap keys every device by its rank", () => {
     "/dev/nvme2n1": 4,
   })
 })
+
+test("shortDevice drops the /dev/ prefix", () => {
+  assert.equal(M.shortDevice(disk({ device: "/dev/nvme2n1" })), "nvme2n1")
+})
+
+test("shortDevice leaves a path without the prefix alone", () => {
+  assert.equal(M.shortDevice(disk({ device: "nvme2n1" })), "nvme2n1")
+})
+
+test("shortDevice falls back to a dash when there is no device", () => {
+  assert.equal(M.shortDevice(null), "—")
+})
