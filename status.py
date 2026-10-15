@@ -39,6 +39,9 @@ MAX_PATH_LEN = 256
 MAX_DEVICE_ARG_LEN = 64
 MAX_MESSAGE_LEN = 256
 MAX_JSON_BYTES = 32 * 1024
+# Upper bound on per-disk summaries in one payload. Five drives cost ~2.5 KiB,
+# so this leaves ample headroom under MAX_JSON_BYTES on a crowded machine.
+MAX_DISKS = 12
 DBUS_TIMEOUT_MS = 10_000
 SETUP_TIMEOUT_SEC = 10
 # Wall clock for the whole status.py run (QML watchdog should match).
@@ -178,12 +181,14 @@ def slim_managed_objects(objs: dict[str, Any]) -> dict[str, dict[str, Any]]:
         entry[IFACE_NVME] = {
           "SmartPowerOnHours": nvme.get("SmartPowerOnHours"),
           "SmartCriticalWarning": crit,
+          "SmartTemperature": nvme.get("SmartTemperature"),
         }
       if IFACE_ATA in ifaces:
         ata = ifaces.get(IFACE_ATA) or {}
         entry[IFACE_ATA] = {
           "SmartFailing": ata.get("SmartFailing"),
           "SmartPowerOnSeconds": ata.get("SmartPowerOnSeconds"),
+          "SmartTemperature": ata.get("SmartTemperature"),
         }
     if has_block:
       block = ifaces.get(IFACE_BLOCK) or {}
@@ -324,6 +329,18 @@ def ata_attr_raw(attrs: Any, *names: str) -> int | None:
   return None
 
 
+def kelvin_to_c(value: Any) -> int | None:
+  """UDisks2 reports SmartTemperature in Kelvin; the UI wants Celsius."""
+  # NVMe reports a uint16, ATA a double; both in Kelvin.
+  try:
+    kelvin = float(value)
+  except (TypeError, ValueError):
+    return None
+  if kelvin <= 0:
+    return None
+  return int(round(kelvin - 273.15))
+
+
 def summarize_nvme(drive: dict[str, Any], nvme_props: dict[str, Any], attrs: dict[str, Any], device: str) -> dict[str, Any]:
   percent_used = as_int(attrs.get("percent_used"))
   life_remaining = None if percent_used is None else max(0, 100 - percent_used)
@@ -355,6 +372,7 @@ def summarize_nvme(drive: dict[str, Any], nvme_props: dict[str, Any], attrs: dic
     "availableSparePercent": spare,
     "percentageUsed": percent_used,
     "lifeRemainingPercent": life_remaining,
+    "temperatureC": kelvin_to_c(nvme_props.get("SmartTemperature")),
     "tbwTiB": bytes_to_tib(written),
     "criticalWarning": len(critical) if isinstance(critical, (list, tuple)) else 0,
   }
@@ -383,6 +401,7 @@ def summarize_ata(drive: dict[str, Any], ata_props: dict[str, Any], attrs: Any, 
     "availableSparePercent": None,
     "percentageUsed": None if life is None else max(0, 100 - life),
     "lifeRemainingPercent": life,
+    "temperatureC": kelvin_to_c(ata_props.get("SmartTemperature")),
     "tbwTiB": None,
     "criticalWarning": 0,
   }
@@ -477,6 +496,33 @@ def fetch_smart(disk: dict[str, Any]) -> dict[str, Any]:
   return summarize_ata(drive, ctrl, attrs, device)
 
 
+def unavailable_summary(disk: dict[str, Any], error: Any) -> dict[str, Any]:
+  """A disk we listed but could not read, shaped like a real summary.
+
+  Keeping the ranking keys present (as None) lets the panel render one row per
+  device without the UI having to special-case a different object shape.
+  """
+  return {
+    "device": clamp_str(disk.get("device") or disk.get("path")),
+    "type": clamp_str(disk.get("protocol") or "", 16),
+    "model": clamp_str(disk.get("model") or ""),
+    "protocol": disk.get("protocol"),
+    "available": False,
+    "error": clamp_str(error, MAX_MESSAGE_LEN),
+    "passed": None,
+    "warning": False,
+    "powerOnHours": None,
+    "reallocatedSectors": None,
+    "mediaErrors": None,
+    "availableSparePercent": None,
+    "percentageUsed": None,
+    "lifeRemainingPercent": None,
+    "temperatureC": None,
+    "tbwTiB": None,
+    "criticalWarning": 0,
+  }
+
+
 def main() -> int:
   raw_arg = sys.argv[1] if len(sys.argv) > 1 else ""
   requested = clamp_str(raw_arg, MAX_DEVICE_ARG_LEN)
@@ -541,7 +587,23 @@ def main() -> int:
     )
     return 0
 
-  summary = fetch_smart(chosen)
+  # One summary per listed device. Serial on purpose: the D-Bus connection is
+  # shared and _executor is a single-worker timeout harness, not a pool.
+  all_summaries = []
+  chosen_summary = None
+  for d in disks[:MAX_DISKS]:
+    if time.monotonic() > deadline:
+      break
+    one = fetch_smart(d)
+    if one.get("ok") is False or "lifeRemainingPercent" not in one:
+      one = unavailable_summary(d, one.get("error"))
+    else:
+      one["available"] = True
+    all_summaries.append(one)
+    if d is chosen:
+      chosen_summary = one
+
+  summary = chosen_summary if chosen_summary is not None else fetch_smart(chosen)
   if summary.get("ok") is False or "lifeRemainingPercent" not in summary:
     emit(
       {
@@ -562,6 +624,7 @@ def main() -> int:
       "message": "",
       "needsSetup": False,
       "devices": devices,
+      "disks": all_summaries,
       "disk": summary,
     }
   )

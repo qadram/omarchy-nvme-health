@@ -57,6 +57,42 @@ function parseStatus(text) {
   }
 }
 
+// Severity ranking: which disk most deserves the user's attention.
+// Higher rank wins. Kept pure so it can be tested without Qt or hardware.
+function severityRank(disk) {
+  if (asInt(disk.criticalWarning, 0) !== 0) return 5
+  if (asInt(disk.mediaErrors, 0) > 0) return 4
+  // status.py already raises `warning` for spare under 10% or life at/below
+  // 10%; trust it rather than duplicating its thresholds here.
+  if (disk.warning === true) return 3
+  // Spare below 100% is not yet a warning, but it outranks an untouched disk.
+  if (asInt(disk.availableSparePercent, 100) < 100) return 2
+  return 0
+}
+
+// True when a is the one to surface instead of b.
+function isWorse(a, b) {
+  var rankA = severityRank(a)
+  var rankB = severityRank(b)
+  if (rankA !== rankB) return rankA > rankB
+
+  var lifeA = asInt(a.lifeRemainingPercent, 100)
+  var lifeB = asInt(b.lifeRemainingPercent, 100)
+  if (lifeA !== lifeB) return lifeA < lifeB
+
+  // Equally worn: surface the hotter one.
+  return asInt(a.temperatureC, 0) > asInt(b.temperatureC, 0)
+}
+
+function worstDisk(disks) {
+  if (!Array.isArray(disks) || disks.length === 0) return null
+  var best = disks[0]
+  for (var i = 1; i < disks.length; i++) {
+    if (isWorse(disks[i], best)) best = disks[i]
+  }
+  return best
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     asInt: asInt,
@@ -66,6 +102,8 @@ if (typeof module !== "undefined") {
     formatPercent: formatPercent,
     barLabel: barLabel,
     parseStatus: parseStatus,
+    severityRank: severityRank,
+    worstDisk: worstDisk,
     MAX_STATUS_CHARS: MAX_STATUS_CHARS
   }
 }
