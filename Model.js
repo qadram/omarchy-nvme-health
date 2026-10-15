@@ -93,6 +93,35 @@ function worstDisk(disks) {
   return best
 }
 
+// Severity per device, for persisting between polls.
+function severityMap(disks) {
+  var map = {}
+  if (!Array.isArray(disks)) return map
+  for (var i = 0; i < disks.length; i++) {
+    var d = disks[i]
+    if (d && d.device) map[String(d.device)] = severityRank(d)
+  }
+  return map
+}
+
+// The disk to announce: the worst one whose rank rose since `previous`.
+// A device missing from `previous` is treated as having been healthy, so a
+// drive that is already degraded on first run is reported once.
+function worsenedDisk(previous, disks) {
+  if (!Array.isArray(disks)) return null
+  var before = previous && typeof previous === "object" ? previous : {}
+  var found = null
+  for (var i = 0; i < disks.length; i++) {
+    var d = disks[i]
+    if (!d || !d.device) continue
+    var key = String(d.device)
+    var was = asInt(before[key], 0)
+    var now = severityRank(d)
+    if (now > was && (found === null || now > severityRank(found))) found = d
+  }
+  return found
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     asInt: asInt,
@@ -104,6 +133,8 @@ if (typeof module !== "undefined") {
     parseStatus: parseStatus,
     severityRank: severityRank,
     worstDisk: worstDisk,
+    severityMap: severityMap,
+    worsenedDisk: worsenedDisk,
     MAX_STATUS_CHARS: MAX_STATUS_CHARS
   }
 }

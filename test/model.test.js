@@ -60,3 +60,49 @@ test("worstDisk prefers a warning disk over one with merely reduced spare", () =
 
   assert.equal(M.worstDisk([spareDipped, nearEndOfLife]).device, "/dev/nvme2n1")
 })
+
+test("worsenedDisk returns the disk whose rank rose since the last poll", () => {
+  const previous = { "/dev/nvme1n1": 0, "/dev/nvme2n1": 0 }
+  const steady = disk({ device: "/dev/nvme1n1" })
+  const degraded = disk({ device: "/dev/nvme2n1", mediaErrors: 1, warning: true })
+
+  assert.equal(M.worsenedDisk(previous, [steady, degraded]).device, "/dev/nvme2n1")
+})
+
+test("worsenedDisk ignores a disk that stayed at the same rank", () => {
+  const previous = { "/dev/nvme1n1": 4 }
+  const stillBad = disk({ device: "/dev/nvme1n1", mediaErrors: 7, warning: true })
+
+  assert.equal(M.worsenedDisk(previous, [stillBad]), null)
+})
+
+test("worsenedDisk ignores a disk that improved", () => {
+  const previous = { "/dev/nvme1n1": 4 }
+  const recovered = disk({ device: "/dev/nvme1n1" })
+
+  assert.equal(M.worsenedDisk(previous, [recovered]), null)
+})
+
+test("worsenedDisk reports a disk absent from the previous poll", () => {
+  const degraded = disk({ device: "/dev/nvme9n1", criticalWarning: 1 })
+
+  assert.equal(M.worsenedDisk({}, [degraded]).device, "/dev/nvme9n1")
+})
+
+test("worsenedDisk picks the worst when several disks rose at once", () => {
+  const previous = { "/dev/nvme1n1": 0, "/dev/nvme2n1": 0 }
+  const spareDipped = disk({ device: "/dev/nvme1n1", availableSparePercent: 80 })
+  const critical = disk({ device: "/dev/nvme2n1", criticalWarning: 1 })
+
+  assert.equal(M.worsenedDisk(previous, [spareDipped, critical]).device, "/dev/nvme2n1")
+})
+
+test("severityMap keys every device by its rank", () => {
+  const healthy = disk({ device: "/dev/nvme1n1" })
+  const bad = disk({ device: "/dev/nvme2n1", mediaErrors: 2, warning: true })
+
+  assert.deepEqual(M.severityMap([healthy, bad]), {
+    "/dev/nvme1n1": 0,
+    "/dev/nvme2n1": 4,
+  })
+})

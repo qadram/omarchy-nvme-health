@@ -100,15 +100,6 @@ Panel {
     checkTransitions()
   }
 
-  function severityMap(list) {
-    var map = {}
-    for (var i = 0; i < list.length; i++) {
-      var d = list[i]
-      if (d && d.device) map[String(d.device)] = Model.severityRank(d)
-    }
-    return map
-  }
-
   function severityReason(d) {
     if (Model.asInt(d.criticalWarning, 0) !== 0) return "SMART critical warning"
     if (Model.asInt(d.mediaErrors, 0) > 0) return "media errors: " + d.mediaErrors
@@ -123,19 +114,9 @@ Panel {
   // several disks worsen at once, the worst one speaks for the batch.
   function checkTransitions() {
     if (!root.stateLoaded) return
-    var current = severityMap(root.disks)
-    var worsened = null
-    for (var i = 0; i < root.disks.length; i++) {
-      var d = root.disks[i]
-      if (!d || !d.device) continue
-      var key = String(d.device)
-      var before = root.lastSeen.hasOwnProperty(key) ? Number(root.lastSeen[key]) : 0
-      var now = Number(current[key])
-      if (now > before && (worsened === null || now > Model.severityRank(worsened)))
-        worsened = d
-    }
-    root.lastSeen = current
-    stateFile.setText(JSON.stringify({ version: 1, severity: current }, null, 2) + "\n")
+    var worsened = Model.worsenedDisk(root.lastSeen, root.disks)
+    root.lastSeen = Model.severityMap(root.disks)
+    stateFile.setText(JSON.stringify({ version: 1, severity: root.lastSeen }, null, 2) + "\n")
     if (worsened && root.notifyEnabled) notifyDegraded(worsened)
   }
 
