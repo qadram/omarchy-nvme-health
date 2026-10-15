@@ -2,23 +2,28 @@
   "schemaVersion": 1,
   "id": "io.github.qadram.nvme-health",
   "name": "NVMe Health",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "qadram",
   "license": "MIT",
-  "description": "Disk SMART health in the Omarchy bar via UDisks2: power-on hours, reallocated sectors, TBW, and remaining life.",
-  "kinds": ["bar-widget"],
+  "description": "Disk SMART health for every drive in the Omarchy bar via UDisks2: temperature, remaining life, spare and media errors, with a notification when a disk gets worse.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
   "entryPoints": {
+    "service": "Service.qml",
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "NVMe Health",
-    "description": "SMART health summary with remaining life estimate.",
+    "description": "SMART health for every drive; the bar shows the one that needs attention.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 300,
-      "device": ""
+      "device": "",
+      "notify": true
     },
     "schema": [
       {
@@ -36,7 +41,14 @@
         "label": "Device path",
         "defaultValue": "",
         "maxLength": 64,
-        "description": "Empty selects the first NVMe (then first ATA drive) from UDisks2."
+        "description": "Empty watches every drive and the bar shows the worst. Set a device path to watch only that one."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify when a disk gets worse",
+        "defaultValue": true,
+        "description": "Sends a desktop notification on the poll where a disk's health drops."
       }
     ]
   }

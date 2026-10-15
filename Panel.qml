@@ -1,6 +1,8 @@
+// Pure view. The poll, the persisted state and the notification live in
+// Service.qml, which the shell instantiates once; this file is rendered once
+// per bar and must therefore stay free of side effects.
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -12,37 +14,19 @@ Panel {
 
   property var anchorItem: null
   property var hostWidget: null
+  // Injected by BarWidget, which resolves it through the plugin shell facade.
+  property var service: null
 
-  property var status: null
-  property bool loading: false
-  property string lastError: ""
-
-  readonly property var disk: status && status.disk ? status.disk : null
-  readonly property bool warning: disk ? disk.warning === true : (status ? status.ok === false : false)
-  readonly property string label: Model.barLabel(disk, false, status && status.ok === false)
-
-  readonly property int refreshIntervalSec: {
-    var n = Number(setting("refreshIntervalSec", 300))
-    if (!isFinite(n)) return 300
-    return Math.max(60, Math.min(3600, Math.round(n)))
-  }
-  readonly property string configuredDevice: {
-    var s = String(setting("device", "") || "").trim()
-    // Keep in sync with status.py MAX_DEVICE_ARG_LEN.
-    if (s.length > 64) return s.substring(0, 64)
-    return s
-  }
+  readonly property var disks: service ? service.disks : []
+  readonly property var worst: service ? service.worst : null
+  readonly property bool loading: service ? service.loading === true : false
+  readonly property string lastError: service ? String(service.lastError || "") : ""
+  readonly property var status: service ? service.status : null
+  readonly property bool warning: service ? service.warning === true : false
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property color contentDim: Qt.darker(contentForeground, 1.5)
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property string pluginDir: {
-    var path = String(Qt.resolvedUrl("."))
-    if (path.indexOf("file://") === 0) path = path.substring(7)
-    if (path.length > 1 && path.charAt(path.length - 1) === "/")
-      path = path.substring(0, path.length - 1)
-    return path
-  }
 
   function open() {
     root.controller.show()
@@ -60,110 +44,30 @@ Panel {
   }
 
   function refresh() {
-    if (proc.running) return
-    loading = true
-    lastError = ""
-    procWatchdog.restart()
-    proc.running = true
+    if (service) service.refresh()
   }
 
-  function applyStatus(text) {
-    var capped = Model.clampStatusText(text)
-    var parsed = Model.parseStatus(capped)
-    if (!parsed) {
-      lastError = "Could not parse status output"
-      status = null
-      return
+  function metricValue(d, key) {
+    if (!d) return "—"
+    if (key === "temp")
+      return d.temperatureC === null || d.temperatureC === undefined
+        ? "—" : String(d.temperatureC) + "°C"
+    if (key === "life") return Model.formatPercent(d.lifeRemainingPercent)
+    if (key === "spare") return Model.formatPercent(d.availableSparePercent)
+    if (key === "errors") {
+      var v = d.protocol === "nvme" ? d.mediaErrors : d.reallocatedSectors
+      return v === null || v === undefined ? "—" : String(v)
     }
-    status = parsed
-    if (!parsed.ok && parsed.message)
-      lastError = String(parsed.message).substring(0, 256)
-  }
-
-  function metricValue(key) {
-    if (!disk) return "—"
-    if (key === "hours") return Model.formatHours(disk.powerOnHours)
-    if (key === "realloc") {
-      if (disk.protocol === "nvme")
-        return disk.mediaErrors === null || disk.mediaErrors === undefined ? "—" : String(disk.mediaErrors)
-      return disk.reallocatedSectors === null || disk.reallocatedSectors === undefined ? "—" : String(disk.reallocatedSectors)
-    }
-    if (key === "tbw") return Model.formatTiB(disk.tbwTiB)
-    if (key === "life") return Model.formatPercent(disk.lifeRemainingPercent)
-    if (key === "spare") return Model.formatPercent(disk.availableSparePercent)
-    if (key === "used") return Model.formatPercent(disk.percentageUsed)
+    if (key === "hours") return Model.formatHours(d.powerOnHours)
+    if (key === "tbw") return Model.formatTiB(d.tbwTiB)
     return "—"
   }
 
-  Timer {
-    id: pollTimer
-    interval: root.refreshIntervalSec * 1000
-    running: true
-    repeat: true
-    onTriggered: root.refresh()
-  }
-
-  // Keep in sync with status.py PROCESS_DEADLINE_SEC (+ small grace).
-  Timer {
-    id: procWatchdog
-    interval: 50000
-    repeat: false
-    onTriggered: {
-      if (!proc.running) return
-      proc.signal(15)
-      procKillTimer.restart()
-    }
-  }
-
-  Timer {
-    id: procKillTimer
-    interval: 2000
-    repeat: false
-    onTriggered: {
-      if (!proc.running) return
-      proc.signal(9)
-      root.loading = false
-      root.lastError = "status.py timed out"
-      root.status = null
-    }
-  }
-
-  Component.onCompleted: Qt.callLater(root.refresh)
-
-  Process {
-    id: proc
-    // Absolute path, not bare "python3": a version manager (mise, asdf,
-    // pyenv, etc.) that puts its shims ahead of /usr/bin in PATH -- a
-    // common, supported setup, not a misconfiguration -- makes a
-    // PATH-resolved "python3" hit an isolated interpreter with no
-    // python-gobject installed instead of the system one this plugin
-    // depends on for UDisks2/gi access. Reproduced directly: status.py
-    // raised `ModuleNotFoundError: No module named 'gi'` under a mise
-    // Python, and returned real SMART JSON under /usr/bin/python3 on the
-    // same machine, same install, only the interpreter changed.
-    command: root.configuredDevice !== ""
-      ? ["/usr/bin/python3", root.pluginDir + "/status.py", root.configuredDevice]
-      : ["/usr/bin/python3", root.pluginDir + "/status.py"]
-    stdout: StdioCollector {
-      id: statusStdout
-      waitForEnd: true
-    }
-    // Do not attach a stderr collector: StdioCollector has no byte cap.
-    // status.py emits all errors as bounded JSON on stdout.
-    stderr: null
-    onExited: function(exitCode) {
-      procWatchdog.stop()
-      procKillTimer.stop()
-      root.loading = false
-      // Cap before parse/UI; status.py also refuses to emit > MAX_JSON_BYTES.
-      var out = Model.clampStatusText(statusStdout.text || "")
-      if (out.trim() !== "") {
-        root.applyStatus(out)
-        return
-      }
-      root.lastError = "status.py failed (" + exitCode + ")"
-      root.status = null
-    }
+  function diskColor(d) {
+    if (!d || d.available === false) return root.contentDim
+    if (d.warning === true || Model.severityRank(d) >= 3)
+      return root.bar ? root.bar.urgent : Color.urgent
+    return root.contentForeground
   }
 
   KeyboardPanel {
@@ -173,7 +77,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(320))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(content.implicitHeight)
 
     PanelKeyCatcher {
@@ -193,7 +97,9 @@ Panel {
 
         Text {
           width: parent.width
-          text: disk && disk.model ? disk.model : "Disk SMART"
+          text: root.disks.length > 0
+            ? "Disk SMART — " + root.disks.length + (root.disks.length === 1 ? " drive" : " drives")
+            : "Disk SMART"
           color: root.contentForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.subtitle
@@ -203,11 +109,13 @@ Panel {
 
         Text {
           width: parent.width
-          visible: disk && disk.device
-          text: disk ? String(disk.device) : ""
-          color: root.contentDim
+          visible: root.service === null
+          text: "This bar does not give plugins access to their own service, "
+            + "so no SMART data can be read. Known upstream: omarchy#11796."
+          color: root.bar ? root.bar.urgent : Color.urgent
           font.family: root.contentFontFamily
-          font.pixelSize: Style.font.caption
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
         }
 
         Text {
@@ -216,72 +124,136 @@ Panel {
           text: root.lastError !== ""
             ? root.lastError
             : (status && status.message
-                ? String(status.message).substring(0, 256)
-                : "Could not read disk SMART data.")
+              ? String(status.message).substring(0, 256)
+              : "Could not read disk SMART data.")
           color: root.warning ? (root.bar ? root.bar.urgent : Color.urgent) : root.contentDim
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.WordWrap
         }
 
-        Text {
-          width: parent.width
-          visible: !!disk
-          text: {
-            if (!disk) return ""
-            if (disk.passed === true) return "SMART: PASSED"
-            if (disk.passed === false) return "SMART: FAILED"
-            return root.loading ? "Refreshing…" : "SMART status"
-          }
-          color: disk && disk.passed === false
-            ? (root.bar ? root.bar.urgent : Color.urgent)
-            : root.contentForeground
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Column {
+        // One aligned row per drive. Explicit widths instead of a nested
+        // Repeater so the columns line up without a layout pass.
+        Row {
           width: parent.width
           spacing: Style.space(6)
-          visible: !!disk
+          visible: root.disks.length > 0
 
-          Repeater {
-            model: [
-              { label: "Life remaining", key: "life" },
-              { label: "Power-on", key: "hours" },
-              { label: disk && disk.protocol === "nvme" ? "Media errors" : "Reallocated sectors", key: "realloc" },
-              { label: "TBW", key: "tbw" },
-              { label: "Spare", key: "spare" },
-              { label: "Wear used", key: "used" }
-            ]
+          Text {
+            width: Style.space(76)
+            text: "DRIVE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-            Row {
-              required property var modelData
-              width: content.width
-              spacing: Style.space(12)
-              visible: {
-                if (!disk) return false
-                if (modelData.key === "spare" || modelData.key === "used")
-                  return disk.protocol === "nvme"
-                return true
-              }
+          Text {
+            width: Style.space(130)
+            text: "MODEL"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-              Text {
-                width: Style.space(150)
-                text: modelData.label
-                color: root.contentDim
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
+          Text {
+            width: Style.space(46)
+            horizontalAlignment: Text.AlignRight
+            text: "TEMP"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
 
-              Text {
-                text: root.metricValue(modelData.key)
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
+          Text {
+            width: Style.space(46)
+            horizontalAlignment: Text.AlignRight
+            text: "LIFE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: Style.space(52)
+            horizontalAlignment: Text.AlignRight
+            text: "SPARE"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: Style.space(40)
+            horizontalAlignment: Text.AlignRight
+            text: "ERR"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Repeater {
+          model: root.disks
+
+          Row {
+            required property var modelData
+            width: content.width
+            spacing: Style.space(6)
+
+            Text {
+              width: Style.space(76)
+              text: Model.shortDevice(modelData)
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: modelData === root.worst
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: Style.space(130)
+              text: modelData.model ? String(modelData.model) : "—"
+              color: root.contentDim
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: Style.space(46)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "temp")
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(46)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "life")
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(52)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "spare")
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: Style.space(40)
+              horizontalAlignment: Text.AlignRight
+              text: root.metricValue(modelData, "errors")
+              color: root.diskColor(modelData)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: root.metricValue(modelData, "errors") !== "0"
             }
           }
         }
