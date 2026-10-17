@@ -57,6 +57,22 @@ function parseStatus(text) {
   }
 }
 
+function nextIndex(i, n, delta) {
+  if (!n || n < 1) return 0
+  i = Math.round(Number(i) || 0)
+  delta = Math.round(Number(delta) || 0)
+  return ((i + delta) % n + n) % n
+}
+
+function indexOfDevice(disks, device) {
+  if (!disks || !disks.length) return -1
+  var want = String(device || "")
+  for (var i = 0; i < disks.length; i++) {
+    if (disks[i] && String(disks[i].device || "") === want) return i
+  }
+  return -1
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     asInt: asInt,
@@ -66,6 +82,8 @@ if (typeof module !== "undefined") {
     formatPercent: formatPercent,
     barLabel: barLabel,
     parseStatus: parseStatus,
+    nextIndex: nextIndex,
+    indexOfDevice: indexOfDevice,
     MAX_STATUS_CHARS: MAX_STATUS_CHARS
   }
 }

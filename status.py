@@ -27,6 +27,7 @@ IFACE_NVME = "org.freedesktop.UDisks2.NVMe.Controller"
 IFACE_ATA = "org.freedesktop.UDisks2.Drive.Ata"
 IFACE_BLOCK = "org.freedesktop.UDisks2.Block"
 IFACE_PARTITION = "org.freedesktop.UDisks2.Partition"
+IFACE_FS = "org.freedesktop.UDisks2.Filesystem"
 
 # Hard ceilings: UDisks GetManagedObjects can be large; keep parsing and
 # the document we emit bounded so the shell/QML cannot be flooded.
@@ -43,6 +44,7 @@ DBUS_TIMEOUT_MS = 10_000
 SETUP_TIMEOUT_SEC = 10
 # Wall clock for the whole status.py run (QML watchdog should match).
 PROCESS_DEADLINE_SEC = 45
+MAX_SMART_DISKS = 8
 
 NVME_ATTR_KEYS = ("percent_used", "avail_spare", "media_errors", "total_data_written")
 
@@ -192,9 +194,20 @@ def slim_managed_objects(objs: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "Drive": drive_ref,
         "Device": block.get("Device"),
         "PreferredDevice": block.get("PreferredDevice"),
+        "CryptoBackingDevice": safe_dbus_path(block.get("CryptoBackingDevice")) or "",
       }
       if IFACE_PARTITION in ifaces:
         entry[IFACE_PARTITION] = True
+      if IFACE_FS in ifaces:
+        fs = ifaces.get(IFACE_FS) or {}
+        mps = fs.get("MountPoints") or []
+        decoded: list[str] = []
+        if isinstance(mps, (list, tuple)):
+          for mp in list(mps)[:16]:
+            point = bytes_to_path(mp)
+            if point:
+              decoded.append(point)
+        entry[IFACE_FS] = {"MountPoints": decoded}
 
     if entry:
       slim[safe_path] = entry
@@ -266,6 +279,54 @@ def block_paths_for_drive(objects: dict[str, Any], drive_path: str) -> list[str]
     if device:
       names.append(device)
   return names
+
+
+def resolve_physical_drive(objects: dict[str, Any], block_path: str) -> str:
+  """Follow Block.CryptoBackingDevice to the physical drive.
+
+  On LUKS installs (Omarchy default) `/` is mounted from a dm-crypt
+  cleartext device whose Block.Drive is `/`. Walk the backing chain
+  (cleartext -> LUKS partition -> drive) so mounts resolve to hardware.
+  """
+  current = block_path
+  seen: set[str] = set()
+  for _ in range(5):
+    if not current or current in seen:
+      break
+    seen.add(current)
+    ifaces = objects.get(current)
+    if not isinstance(ifaces, dict):
+      break
+    block = ifaces.get(IFACE_BLOCK)
+    if not isinstance(block, dict):
+      break
+    backing = str(block.get("CryptoBackingDevice") or "")
+    if backing and backing not in ("", "/") and backing in objects:
+      current = backing
+      continue
+    return str(block.get("Drive") or "")
+  block = (objects.get(current) or {}).get(IFACE_BLOCK) or {}
+  return str(block.get("Drive") or "") if isinstance(block, dict) else ""
+
+
+def mounts_for_drive(objects: dict[str, Any], drive_path: str) -> list[str]:
+  found: list[str] = []
+  for block_path, ifaces in objects.items():
+    block = ifaces.get(IFACE_BLOCK)
+    if not block:
+      continue
+    fs = ifaces.get(IFACE_FS) or {}
+    if not fs.get("MountPoints"):
+      continue
+    if resolve_physical_drive(objects, block_path) != drive_path:
+      continue
+    for mp in fs.get("MountPoints") or []:
+      text_mp = clamp_str(mp, MAX_PATH_LEN)
+      if text_mp and text_mp not in found:
+        found.append(text_mp)
+      if len(found) >= 16:
+        return found
+  return found
 
 
 def device_matches(requested: str, candidates: list[str], drive_id: str) -> str | None:
@@ -420,9 +481,23 @@ def enumerate_drives(objects: dict[str, Any], deadline: float) -> list[dict[str,
         "model": clamp_str(drive.get("Model")),
         "drive": drive,
         "ctrl_props": ifaces.get(IFACE_NVME if is_nvme else IFACE_ATA) or {},
+        "mounts": mounts_for_drive(objects, path),
       }
     )
   return disks
+
+
+def mark_system_disks(disks: list[dict[str, Any]]) -> str | None:
+  """Flag the disk backing `/`; return its device (or None). First match wins."""
+  system_device: str | None = None
+  for d in disks:
+    if "/" in (d.get("mounts") or []):
+      d["is_system"] = True
+      if system_device is None:
+        system_device = d.get("device") or d.get("path")
+    else:
+      d["is_system"] = False
+  return system_device
 
 
 def pick_disk(disks: list[dict[str, Any]], requested: str) -> dict[str, Any] | None:
@@ -444,30 +519,57 @@ def pick_disk(disks: list[dict[str, Any]], requested: str) -> dict[str, Any] | N
       return prefix[0]
     return None
   for d in disks:
+    if "/" in (d.get("mounts") or []):
+      return d
+  for d in disks:
+    if d.get("mounts"):
+      return d
+  for d in disks:
     if d.get("protocol") == "nvme":
       return d
   return disks[0]
 
 
-def fetch_smart(disk: dict[str, Any]) -> dict[str, Any]:
+def fetch_smart(disk: dict[str, Any], refresh: bool = True, deadline: float | None = None) -> dict[str, Any]:
   path = disk["path"]
   is_nvme = disk.get("protocol") == "nvme"
   iface = IFACE_NVME if is_nvme else IFACE_ATA
   device = disk.get("device") or path
-  try:
-    call_method(path, iface, "SmartUpdate")
-  except Exception:
-    pass
-  try:
-    attrs_pack = call_method(path, iface, "SmartGetAttributes")
-  except Exception as exc:
+
+  def failed(message: str) -> dict[str, Any]:
     return {
       "ok": False,
       "device": clamp_str(device),
-      "error": clamp_str(exc, MAX_MESSAGE_LEN),
+      "error": clamp_str(message, MAX_MESSAGE_LEN),
       "protocol": disk.get("protocol"),
       "model": disk.get("model") or "",
+      "passed": None,
+      "warning": True,
+      "powerOnHours": None,
+      "reallocatedSectors": None,
+      "mediaErrors": None,
+      "availableSparePercent": None,
+      "percentageUsed": None,
+      "lifeRemainingPercent": None,
+      "tbwTiB": None,
+      "criticalWarning": 0,
     }
+
+  if deadline is not None and time.monotonic() > deadline - 2:
+    return failed("timed out before SMART read")
+  # SmartUpdate spins up idle drives; only refresh the selected disk and
+  # read cached attributes for the rest.
+  if refresh:
+    try:
+      call_method(path, iface, "SmartUpdate")
+    except Exception:
+      pass
+    if deadline is not None and time.monotonic() > deadline - 2:
+      return failed("timed out before SMART read")
+  try:
+    attrs_pack = call_method(path, iface, "SmartGetAttributes")
+  except Exception as exc:
+    return failed(str(exc))
 
   attrs = attrs_pack[0] if isinstance(attrs_pack, tuple) else attrs_pack
   drive = disk.get("drive") or {}
@@ -498,6 +600,7 @@ def main() -> int:
     return 0
 
   disks = enumerate_drives(objects, deadline)
+  mark_system_disks(disks)
   # Drop the managed-object tree as soon as the light inventory exists.
   del objects
 
@@ -506,6 +609,7 @@ def main() -> int:
       "name": clamp_str(d.get("device") or d.get("path")),
       "type": clamp_str(d.get("protocol") or "", 16),
       "info": clamp_str(d.get("model") or d.get("device") or ""),
+      "system": bool(d.get("is_system")),
     }
     for d in disks
   ]
@@ -541,16 +645,52 @@ def main() -> int:
     )
     return 0
 
-  summary = fetch_smart(chosen)
-  if summary.get("ok") is False or "lifeRemainingPercent" not in summary:
+  # Fetch the chosen disk first so a configured/system disk always has a
+  # summary even under deadline pressure; only it gets SmartUpdate.
+  ordered = [chosen] + [d for d in disks if d.get("path") != chosen.get("path")]
+  summaries: list[dict[str, Any]] = []
+  for d in ordered[:MAX_SMART_DISKS]:
+    if time.monotonic() > deadline - 2:
+      break
+    summary = fetch_smart(d, refresh=(d.get("path") == chosen.get("path")), deadline=deadline)
+    summary["system"] = bool(d.get("is_system"))
+    if summary.get("ok") is False:
+      summary["warning"] = True
+    summaries.append(summary)
+
+  disk = None
+  if chosen:
+    want = chosen.get("device")
+    for summary in summaries:
+      if summary.get("device") == want:
+        disk = summary
+        break
+  if disk is None and not requested and summaries:
+    disk = summaries[0]
+
+  if disk is None:
+    if chosen is None:
+      message = "No matching NVMe/ATA drive was found."
+      code = "no_devices"
+    else:
+      message = "Could not read SMART attributes."
+      code = "smart_unavailable"
+      if requested:
+        detail = ""
+        for summary in summaries:
+          if summary.get("device") == chosen.get("device") and summary.get("error"):
+            detail = f": {summary.get('error')}"
+            break
+        message = f"Could not read SMART for {requested}{detail}."
     emit(
       {
         "ok": False,
-        "error": "smart_unavailable",
-        "message": clamp_str(summary.get("error") or "Could not read SMART attributes.", MAX_MESSAGE_LEN),
+        "error": code,
+        "message": message,
         "needsSetup": False,
         "devices": devices,
         "disk": None,
+        "disks": summaries,
       }
     )
     return 0
@@ -562,7 +702,8 @@ def main() -> int:
       "message": "",
       "needsSetup": False,
       "devices": devices,
-      "disk": summary,
+      "disk": disk,
+      "disks": summaries,
     }
   )
   return 0

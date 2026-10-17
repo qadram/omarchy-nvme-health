@@ -18,7 +18,8 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 300,
-      "device": ""
+      "device": "",
+      "showPercentage": true
     },
     "schema": [
       {
@@ -36,7 +37,13 @@
         "label": "Device path",
         "defaultValue": "",
         "maxLength": 64,
-        "description": "Empty selects the first NVMe (then first ATA drive) from UDisks2."
+        "description": "Empty selects the system disk (the drive backing /)."
+      },
+      {
+        "key": "showPercentage",
+        "type": "boolean",
+        "label": "Show remaining-life percentage on the bar",
+        "defaultValue": true
       }
     ]
   }

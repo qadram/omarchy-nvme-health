@@ -16,10 +16,29 @@ Panel {
   property var status: null
   property bool loading: false
   property string lastError: ""
+  property int selectedIndex: 0
+  property string selectedDevice: ""
 
   readonly property var disk: status && status.disk ? status.disk : null
-  readonly property bool warning: disk ? disk.warning === true : (status ? status.ok === false : false)
-  readonly property string label: Model.barLabel(disk, false, status && status.ok === false)
+  readonly property var disks: {
+    if (status && status.disks && status.disks.length)
+      return status.disks
+    if (disk) return [disk]
+    return []
+  }
+  readonly property var shownDisk: {
+    if (disks.length)
+      return disks[Math.max(0, Math.min(selectedIndex, disks.length - 1))]
+    return disk
+  }
+  readonly property bool warning: {
+    for (var i = 0; i < disks.length; i++) {
+      if (disks[i] && (disks[i].warning === true || disks[i].ok === false)) return true
+    }
+    return status ? status.ok === false : false
+  }
+  readonly property string label: Model.barLabel(shownDisk, false, status && status.ok === false)
+  readonly property bool canSwitch: disks.length > 1
 
   readonly property int refreshIntervalSec: {
     var n = Number(setting("refreshIntervalSec", 300))
@@ -78,20 +97,43 @@ Panel {
     status = parsed
     if (!parsed.ok && parsed.message)
       lastError = String(parsed.message).substring(0, 256)
+    syncSelection()
+  }
+
+  function syncSelection() {
+    var list = disks
+    if (!list.length) {
+      selectedIndex = 0
+      return
+    }
+    var want = selectedDevice
+    if (!want && disk && disk.device) want = String(disk.device)
+    var idx = Model.indexOfDevice(list, want)
+    if (idx < 0) idx = 0
+    selectedIndex = idx
+    selectedDevice = list[idx] && list[idx].device ? String(list[idx].device) : ""
+  }
+
+  function cycleDisk(delta) {
+    if (!canSwitch) return
+    selectedIndex = Model.nextIndex(selectedIndex, disks.length, delta)
+    var d = disks[selectedIndex]
+    selectedDevice = d && d.device ? String(d.device) : ""
   }
 
   function metricValue(key) {
-    if (!disk) return "—"
-    if (key === "hours") return Model.formatHours(disk.powerOnHours)
+    var d = shownDisk
+    if (!d) return "—"
+    if (key === "hours") return Model.formatHours(d.powerOnHours)
     if (key === "realloc") {
-      if (disk.protocol === "nvme")
-        return disk.mediaErrors === null || disk.mediaErrors === undefined ? "—" : String(disk.mediaErrors)
-      return disk.reallocatedSectors === null || disk.reallocatedSectors === undefined ? "—" : String(disk.reallocatedSectors)
+      if (d.protocol === "nvme")
+        return d.mediaErrors === null || d.mediaErrors === undefined ? "—" : String(d.mediaErrors)
+      return d.reallocatedSectors === null || d.reallocatedSectors === undefined ? "—" : String(d.reallocatedSectors)
     }
-    if (key === "tbw") return Model.formatTiB(disk.tbwTiB)
-    if (key === "life") return Model.formatPercent(disk.lifeRemainingPercent)
-    if (key === "spare") return Model.formatPercent(disk.availableSparePercent)
-    if (key === "used") return Model.formatPercent(disk.percentageUsed)
+    if (key === "tbw") return Model.formatTiB(d.tbwTiB)
+    if (key === "life") return Model.formatPercent(d.lifeRemainingPercent)
+    if (key === "spare") return Model.formatPercent(d.availableSparePercent)
+    if (key === "used") return Model.formatPercent(d.percentageUsed)
     return "—"
   }
 
@@ -182,8 +224,13 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onActivateRequested: root.refresh()
+      onMoveRequested: function(dx, dy) {
+        if (dx !== 0) root.cycleDisk(dx)
+      }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "n" || t === "N" || t === "l" || t === "L") root.cycleDisk(1)
+        else if (t === "p" || t === "P" || t === "h" || t === "H") root.cycleDisk(-1)
       }
 
       Column {
@@ -191,9 +238,66 @@ Panel {
         width: parent.width
         spacing: Style.space(10)
 
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.canSwitch
+
+          Text {
+            text: "‹"
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            MouseArea {
+              anchors.fill: parent
+              anchors.margins: -6
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.cycleDisk(-1)
+            }
+          }
+
+          Text {
+            text: (root.selectedIndex + 1) + " / " + root.disks.length
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            verticalAlignment: Text.AlignVCenter
+          }
+
+          Text {
+            text: "›"
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            MouseArea {
+              anchors.fill: parent
+              anchors.margins: -6
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.cycleDisk(1)
+            }
+          }
+
+          Text {
+            text: "← → to switch"
+            color: root.contentDim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            verticalAlignment: Text.AlignVCenter
+          }
+        }
+
         Text {
           width: parent.width
-          text: disk && disk.model ? disk.model : "Disk SMART"
+          text: {
+            if (!shownDisk || !shownDisk.model) return "Disk SMART"
+            var name = String(shownDisk.model)
+            var isSystem = shownDisk.system === true
+            if (shownDisk.system === undefined)
+              isSystem = !!(disk && shownDisk.device && disk.device === shownDisk.device)
+            return isSystem ? name + "  (system)" : name
+          }
           color: root.contentForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.subtitle
@@ -203,8 +307,8 @@ Panel {
 
         Text {
           width: parent.width
-          visible: disk && disk.device
-          text: disk ? String(disk.device) : ""
+          visible: shownDisk && shownDisk.device
+          text: shownDisk ? String(shownDisk.device) : ""
           color: root.contentDim
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
@@ -212,12 +316,17 @@ Panel {
 
         Text {
           width: parent.width
-          visible: root.lastError !== "" || (status && status.ok === false)
-          text: root.lastError !== ""
-            ? root.lastError
-            : (status && status.message
+          visible: root.lastError !== "" || (shownDisk && shownDisk.ok === false) || (status && status.ok === false)
+          text: {
+            if (root.lastError !== "") return root.lastError
+            if (shownDisk && shownDisk.ok === false)
+              return shownDisk.error
+                ? String(shownDisk.error).substring(0, 256)
+                : "Could not read SMART data for this disk."
+            return (status && status.message
                 ? String(status.message).substring(0, 256)
                 : "Could not read disk SMART data.")
+          }
           color: root.warning ? (root.bar ? root.bar.urgent : Color.urgent) : root.contentDim
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.bodySmall
@@ -226,14 +335,15 @@ Panel {
 
         Text {
           width: parent.width
-          visible: !!disk
+          visible: !!shownDisk
           text: {
-            if (!disk) return ""
-            if (disk.passed === true) return "SMART: PASSED"
-            if (disk.passed === false) return "SMART: FAILED"
+            if (!shownDisk) return ""
+            if (shownDisk.ok === false) return "Read failed"
+            if (shownDisk.passed === true) return "SMART: PASSED"
+            if (shownDisk.passed === false) return "SMART: FAILED"
             return root.loading ? "Refreshing…" : "SMART status"
           }
-          color: disk && disk.passed === false
+          color: shownDisk && shownDisk.passed === false
             ? (root.bar ? root.bar.urgent : Color.urgent)
             : root.contentForeground
           font.family: root.contentFontFamily
@@ -244,13 +354,13 @@ Panel {
         Column {
           width: parent.width
           spacing: Style.space(6)
-          visible: !!disk
+          visible: !!shownDisk
 
           Repeater {
             model: [
               { label: "Life remaining", key: "life" },
               { label: "Power-on", key: "hours" },
-              { label: disk && disk.protocol === "nvme" ? "Media errors" : "Reallocated sectors", key: "realloc" },
+              { label: shownDisk && shownDisk.protocol === "nvme" ? "Media errors" : "Reallocated sectors", key: "realloc" },
               { label: "TBW", key: "tbw" },
               { label: "Spare", key: "spare" },
               { label: "Wear used", key: "used" }
@@ -261,9 +371,9 @@ Panel {
               width: content.width
               spacing: Style.space(12)
               visible: {
-                if (!disk) return false
+                if (!shownDisk) return false
                 if (modelData.key === "spare" || modelData.key === "used")
-                  return disk.protocol === "nvme"
+                  return shownDisk.protocol === "nvme"
                 return true
               }
 

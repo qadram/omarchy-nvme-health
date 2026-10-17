@@ -1,6 +1,6 @@
 # NVMe Health
 
-![NVMe Health panel on Omarchy](preview.png)
+![System disk (Omarchy)](preview.png)
 
 SMART disk health for the Omarchy Quattro bar: remaining life, power-on hours, media errors / reallocated sectors, and TBW.
 
@@ -28,8 +28,11 @@ omarchy plugin enable "$PLUGIN_ID" --section right
 ## Usage
 
 - **Left click:** open the details panel
+- **Right click** (bar): toggle remaining-life `%` on the bar (shown by default)
 - **Middle click** (bar) or **R / Enter** (panel): refresh
-- Bar label: remaining life `%`, or `!` when something looks wrong
+- **← / →** (or **h / l**, **p / n**, or the ‹ › buttons): switch disk
+- Bar icon is `!` when any disk looks wrong (including a disk whose SMART read failed)
+- Default disk is the one backing `/` (the Omarchy system drive, LUKS-aware)
 
 ## Configure
 
@@ -40,7 +43,8 @@ omarchy bar move io.github.qadram.nvme-health --section right
 Optional settings on the widget entry in `~/.config/omarchy/shell.json`:
 
 - `refreshIntervalSec` — 60–3600 (default `300`)
-- `device` — e.g. `/dev/nvme0n1` (empty = first NVMe)
+- `device` — e.g. `/dev/nvme0n1` (empty = system disk, the drive backing `/`; a configured disk that cannot be read is reported as an error)
+- `showPercentage` — `false` to hide remaining life on the bar (default shown)
 
 ## Remove
 
